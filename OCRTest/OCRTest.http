@@ -1,0 +1,43 @@
+@OCRTest_HostAddress = http://localhost:5093
+
+### Health Check
+GET {{OCRTest_HostAddress}}/api/health
+Accept: application/json
+
+###
+
+### Get Available Receipts
+GET {{OCRTest_HostAddress}}/api/receipt
+Accept: application/json
+
+###
+
+### Process Single Receipt - receipt1.jpeg
+POST {{OCRTest_HostAddress}}/api/receipt/process/receipt1.jpeg
+Accept: application/json
+
+###
+
+### Process Single Receipt - receipt2.jpeg
+POST {{OCRTest_HostAddress}}/api/receipt/process/receipt2.jpeg
+Accept: application/json
+
+###
+
+### Process Single Receipt - receipt3.jpeg
+POST {{OCRTest_HostAddress}}/api/receipt/process/receipt3.jpeg
+Accept: application/json
+
+###
+
+### Process All Receipts
+POST {{OCRTest_HostAddress}}/api/receipt/process-all
+Accept: application/json
+
+###
+
+### Test Error Handling - Non-existent File
+POST {{OCRTest_HostAddress}}/api/receipt/process/nonexistent.jpeg
+Accept: application/json
+
+###
