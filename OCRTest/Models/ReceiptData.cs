@@ -9,4 +9,6 @@ public class ReceiptData
     public double? Cantidad { get; set; }
     public int? Kilometraje { get; set; }
     public string? NumeroDeVale { get; set; }
+    public string? NIT { get; set; }
+    public string? TipoDeCombustible { get; set; }
 }

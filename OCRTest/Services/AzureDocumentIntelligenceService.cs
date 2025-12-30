@@ -10,14 +10,17 @@ public class AzureDocumentIntelligenceService : IAzureDocumentIntelligenceServic
     private readonly DocumentAnalysisClient _client;
     private readonly ILogger<AzureDocumentIntelligenceService> _logger;
     private readonly string _modelId;
+    private readonly AzureDocumentIntelligenceOptions _options;
     private static readonly SemaphoreSlim _rateLimiter = new(1, 1);
-    private static DateTime _lastRequestTime = DateTime.MinValue;
+    private static readonly Queue<DateTime> _requestTimestamps = new();
+    private static readonly object _timestampLock = new object();
 
     public AzureDocumentIntelligenceService(
         IOptions<AzureDocumentIntelligenceOptions> options,
         ILogger<AzureDocumentIntelligenceService> logger)
     {
         var config = options.Value;
+        _options = config;
         _logger = logger;
         _modelId = config.ModelId;
 
@@ -35,13 +38,20 @@ public class AzureDocumentIntelligenceService : IAzureDocumentIntelligenceServic
         await _rateLimiter.WaitAsync(cancellationToken);
         try
         {
-            // F0 tier: 1 request per minute - enforce rate limiting
-            var timeSinceLastRequest = DateTime.UtcNow - _lastRequestTime;
-            if (timeSinceLastRequest < TimeSpan.FromSeconds(60))
+            // Apply rate limiting based on tier configuration
+            if (_options.EnableRateLimiting)
             {
-                var delay = TimeSpan.FromSeconds(60) - timeSinceLastRequest;
-                _logger.LogInformation("Rate limiting: waiting {Seconds}s to comply with F0 tier limits", delay.TotalSeconds);
-                await Task.Delay(delay, cancellationToken);
+                var delay = CalculateRateLimitDelay();
+                if (delay > TimeSpan.Zero)
+                {
+                    _logger.LogInformation(
+                        "Rate limiting: waiting {Seconds}s to comply with {Tier} tier limits ({MaxRequests} requests per {WindowSeconds}s)",
+                        delay.TotalSeconds,
+                        _options.Tier,
+                        _options.MaxRequestsPerWindow,
+                        _options.RateLimitWindowSeconds);
+                    await Task.Delay(delay, cancellationToken);
+                }
             }
 
             _logger.LogInformation("Sending document to Azure Document Intelligence for analysis with model {ModelId}", _modelId);
@@ -52,14 +62,23 @@ public class AzureDocumentIntelligenceService : IAzureDocumentIntelligenceServic
                 documentStream,
                 cancellationToken: cancellationToken);
 
-            _lastRequestTime = DateTime.UtcNow;
+            // Track this request timestamp
+            if (_options.EnableRateLimiting)
+            {
+                TrackRequest();
+            }
+
             _logger.LogInformation("Document analysis completed successfully");
 
             return operation.Value;
         }
         catch (RequestFailedException ex) when (ex.Status == 429)
         {
-            _logger.LogWarning("Rate limit exceeded (429). F0 tier allows 1 request per minute.");
+            _logger.LogWarning(
+                "Rate limit exceeded (429). {Tier} tier allows {MaxRequests} requests per {WindowSeconds} seconds.",
+                _options.Tier,
+                _options.MaxRequestsPerWindow,
+                _options.RateLimitWindowSeconds);
             throw;
         }
         catch (RequestFailedException ex) when (ex.Status == 401)
@@ -89,6 +108,45 @@ public class AzureDocumentIntelligenceService : IAzureDocumentIntelligenceServic
         catch
         {
             return false;
+        }
+    }
+
+    private TimeSpan CalculateRateLimitDelay()
+    {
+        lock (_timestampLock)
+        {
+            var now = DateTime.UtcNow;
+            var windowStart = now.AddSeconds(-_options.RateLimitWindowSeconds);
+
+            // Remove timestamps outside the current window
+            while (_requestTimestamps.Count > 0 && _requestTimestamps.Peek() < windowStart)
+            {
+                _requestTimestamps.Dequeue();
+            }
+
+            // Check if we're at capacity
+            if (_requestTimestamps.Count >= _options.MaxRequestsPerWindow)
+            {
+                var oldestRequest = _requestTimestamps.Peek();
+                var delay = oldestRequest.AddSeconds(_options.RateLimitWindowSeconds) - now;
+                return delay + TimeSpan.FromMilliseconds(100);
+            }
+
+            return TimeSpan.Zero;
+        }
+    }
+
+    private void TrackRequest()
+    {
+        lock (_timestampLock)
+        {
+            _requestTimestamps.Enqueue(DateTime.UtcNow);
+
+            var maxTrackedRequests = _options.MaxRequestsPerWindow * 2;
+            while (_requestTimestamps.Count > maxTrackedRequests)
+            {
+                _requestTimestamps.Dequeue();
+            }
         }
     }
 }

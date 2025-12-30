@@ -9,4 +9,6 @@ public class ConfidenceScores
     public double Cantidad { get; set; }
     public double Kilometraje { get; set; }
     public double NumeroDeVale { get; set; }
+    public double NIT { get; set; }
+    public double TipoDeCombustible { get; set; }
 }

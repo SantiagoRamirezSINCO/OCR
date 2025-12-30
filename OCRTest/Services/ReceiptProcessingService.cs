@@ -68,7 +68,7 @@ public class ReceiptProcessingService : IReceiptProcessingService
             response.Error = new ProcessingError
             {
                 Code = "RateLimitExceeded",
-                Message = "Azure F0 tier rate limit exceeded. Please wait 60 seconds before retrying."
+                Message = "Azure rate limit exceeded. Please wait before retrying."
             };
         }
         catch (Exception ex)
@@ -267,6 +267,35 @@ public class ReceiptProcessingService : IReceiptProcessingService
             _logger.LogWarning("Could not extract Numero de vale from receipt");
         }
 
+        // Extract NIT (Número de Identificación Tributaria)
+        var (nit, nitConfidence) = ExtractNIT(allText);
+        data.NIT = nit;
+        confidence.NIT = nitConfidence;
+
+        if (!string.IsNullOrEmpty(nit))
+        {
+            _logger.LogDebug("Extracted NIT: {Value} (confidence: {Confidence})", nit, nitConfidence);
+        }
+        else
+        {
+            _logger.LogWarning("Could not extract NIT from receipt");
+        }
+
+        // Extract Tipo de Combustible
+        var (tipoCombustible, tipoConfidence) = ExtractTipoDeCombustible(allText);
+        data.TipoDeCombustible = tipoCombustible;
+        confidence.TipoDeCombustible = tipoConfidence;
+
+        if (!string.IsNullOrEmpty(tipoCombustible))
+        {
+            _logger.LogDebug("Extracted Tipo de combustible: {Value} (confidence: {Confidence})",
+                tipoCombustible, tipoConfidence);
+        }
+        else
+        {
+            _logger.LogWarning("Could not extract Tipo de combustible from receipt");
+        }
+
         return (data, confidence);
     }
 
@@ -455,6 +484,119 @@ public class ReceiptProcessingService : IReceiptProcessingService
 
         _logger.LogDebug("No Numero de vale pattern matched in text");
         return (null, 0);
+    }
+
+    private (string? nit, double confidence) ExtractNIT(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return (null, 0);
+
+        // Pattern 1: "NIT: 900.291.461-4" o "NIT.900.291.461-4" (highest confidence)
+        var pattern1 = new Regex(@"NIT[:\s.]+(\d{1,3}(?:[.,]\d{3})*-\d)", RegexOptions.IgnoreCase);
+        var match1 = pattern1.Match(text);
+        if (match1.Success)
+        {
+            var nit = NormalizeNIT(match1.Groups[1].Value);
+            _logger.LogDebug("NIT matched with pattern 1 (NIT: labeled): {NIT}", nit);
+            return (nit, 0.92);
+        }
+
+        // Pattern 2: "NIT900.291.461-4" - relaxed spacing (high confidence)
+        var pattern2 = new Regex(@"NIT[:\s.]*(\d[\d.,]+\d-\d)", RegexOptions.IgnoreCase);
+        var match2 = pattern2.Match(text);
+        if (match2.Success)
+        {
+            var nit = NormalizeNIT(match2.Groups[1].Value);
+            _logger.LogDebug("NIT matched with pattern 2 (NIT relaxed): {NIT}", nit);
+            return (nit, 0.85);
+        }
+
+        // Pattern 3: Generic Colombian NIT format "900.291.461-4" (medium confidence)
+        var pattern3 = new Regex(@"\b(\d{3}[.,]\d{3}[.,]\d{3}-\d)\b");
+        var match3 = pattern3.Match(text);
+        if (match3.Success)
+        {
+            var nit = NormalizeNIT(match3.Groups[1].Value);
+            _logger.LogDebug("NIT matched with pattern 3 (generic format): {NIT}", nit);
+            return (nit, 0.70);
+        }
+
+        _logger.LogDebug("No NIT pattern matched in text");
+        return (null, 0);
+    }
+
+    private string NormalizeNIT(string nit)
+    {
+        // Ensure periods are used as separators (not commas)
+        // Format: XXX.XXX.XXX-X
+        var normalized = nit.Replace(",", ".");
+        normalized = normalized.Trim();
+
+        _logger.LogDebug("Normalized NIT from '{Original}' to '{Normalized}'", nit, normalized);
+        return normalized;
+    }
+
+    private (string? tipoCombustible, double confidence) ExtractTipoDeCombustible(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return (null, 0);
+
+        // Pattern 1: "Combustible: Corriente" (highest confidence)
+        var pattern1 = new Regex(@"Combustible[:\s]+(Corriente|ACPM|Urea)", RegexOptions.IgnoreCase);
+        var match1 = pattern1.Match(text);
+        if (match1.Success)
+        {
+            var tipo = NormalizeTipoCombustible(match1.Groups[1].Value);
+            _logger.LogDebug("Tipo de combustible matched with pattern 1 (Combustible:): {Tipo}", tipo);
+            return (tipo, 0.95);
+        }
+
+        // Pattern 2: "Tipo: ACPM" or "Producto: Corriente" (high confidence)
+        var pattern2 = new Regex(@"(?:Tipo|Producto)[:\s]+(Corriente|ACPM|Urea)", RegexOptions.IgnoreCase);
+        var match2 = pattern2.Match(text);
+        if (match2.Success)
+        {
+            var tipo = NormalizeTipoCombustible(match2.Groups[1].Value);
+            _logger.LogDebug("Tipo de combustible matched with pattern 2 (Tipo/Producto:): {Tipo}", tipo);
+            return (tipo, 0.88);
+        }
+
+        // Pattern 3: Near quantity "Corriente 15.5 Gal" (medium confidence)
+        var pattern3 = new Regex(@"(Corriente|ACPM|Urea)[\s:]+\d+[.,]?\d*\s*(?:Gal|Galones|Lts|Litros)", RegexOptions.IgnoreCase);
+        var match3 = pattern3.Match(text);
+        if (match3.Success)
+        {
+            var tipo = NormalizeTipoCombustible(match3.Groups[1].Value);
+            _logger.LogDebug("Tipo de combustible matched with pattern 3 (near quantity): {Tipo}", tipo);
+            return (tipo, 0.78);
+        }
+
+        // Pattern 4: Standalone fuel type word (lower confidence)
+        var pattern4 = new Regex(@"\b(Corriente|ACPM|Urea)\b", RegexOptions.IgnoreCase);
+        var match4 = pattern4.Match(text);
+        if (match4.Success)
+        {
+            var tipo = NormalizeTipoCombustible(match4.Groups[1].Value);
+            _logger.LogDebug("Tipo de combustible matched with pattern 4 (standalone): {Tipo}", tipo);
+            return (tipo, 0.65);
+        }
+
+        _logger.LogDebug("No Tipo de combustible pattern matched in text");
+        return (null, 0);
+    }
+
+    private string NormalizeTipoCombustible(string tipo)
+    {
+        // Standardize casing: "Corriente", "ACPM", "Urea"
+        var normalized = tipo.Trim().ToUpperInvariant();
+
+        return normalized switch
+        {
+            "CORRIENTE" => "Corriente",
+            "ACPM" => "ACPM", // Acronym stays uppercase
+            "UREA" => "Urea",
+            _ => tipo // Fallback to original if unexpected value
+        };
     }
 
     private bool TryParseDecimal(string value, out double result)

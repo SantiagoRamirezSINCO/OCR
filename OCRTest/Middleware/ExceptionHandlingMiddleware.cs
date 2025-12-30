@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text.Json;
 using Azure;
+using Microsoft.Extensions.Options;
 using OCRTest.Models;
 
 namespace OCRTest.Middleware;
@@ -9,11 +10,16 @@ public class ExceptionHandlingMiddleware
 {
     private readonly RequestDelegate _next;
     private readonly ILogger<ExceptionHandlingMiddleware> _logger;
+    private readonly IOptions<AzureDocumentIntelligenceOptions> _options;
 
-    public ExceptionHandlingMiddleware(RequestDelegate next, ILogger<ExceptionHandlingMiddleware> logger)
+    public ExceptionHandlingMiddleware(
+        RequestDelegate next,
+        ILogger<ExceptionHandlingMiddleware> logger,
+        IOptions<AzureDocumentIntelligenceOptions> options)
     {
         _next = next;
         _logger = logger;
+        _options = options;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -35,8 +41,10 @@ public class ExceptionHandlingMiddleware
         catch (RequestFailedException ex) when (ex.Status == 429)
         {
             _logger.LogWarning(ex, "Azure rate limit exceeded");
-            await HandleExceptionAsync(context, HttpStatusCode.TooManyRequests, "RateLimitExceeded",
-                "Azure F0 tier rate limit exceeded. Please wait 60 seconds before retrying.");
+            var config = _options.Value;
+            var message = $"Azure {config.Tier} tier rate limit exceeded ({config.MaxRequestsPerWindow} requests per {config.RateLimitWindowSeconds}s). Please wait before retrying.";
+
+            await HandleExceptionAsync(context, HttpStatusCode.TooManyRequests, "RateLimitExceeded", message);
         }
         catch (RequestFailedException ex) when (ex.Status == 401)
         {
