@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using Azure;
 using Azure.AI.FormRecognizer.DocumentAnalysis;
@@ -11,16 +12,25 @@ public class ReceiptProcessingService : IReceiptProcessingService
 {
     private readonly IAzureDocumentIntelligenceService _azureService;
     private readonly ILogger<ReceiptProcessingService> _logger;
+    private readonly IReceiptRepository? _repository;
+    private readonly IReceiptStorageService? _storageService;
+    private readonly IFileValidationService? _validationService;
     private readonly string _receiptsFolderPath;
     private readonly string[] _supportedExtensions;
 
     public ReceiptProcessingService(
         IAzureDocumentIntelligenceService azureService,
         ILogger<ReceiptProcessingService> logger,
-        IConfiguration configuration)
+        IConfiguration configuration,
+        IReceiptRepository? repository = null,
+        IReceiptStorageService? storageService = null,
+        IFileValidationService? validationService = null)
     {
         _azureService = azureService;
         _logger = logger;
+        _repository = repository;
+        _storageService = storageService;
+        _validationService = validationService;
         _receiptsFolderPath = configuration["ReceiptProcessing:ReceiptsFolderPath"] ?? "exampleReceipts";
         _supportedExtensions = configuration.GetSection("ReceiptProcessing:SupportedExtensions").Get<string[]>()
             ?? new[] { ".jpg", ".jpeg", ".png", ".pdf" };
@@ -304,38 +314,57 @@ public class ReceiptProcessingService : IReceiptProcessingService
         if (string.IsNullOrWhiteSpace(text))
             return (null, 0);
 
-        // Pattern 1: "Placa: ABC123" or "Placa ABC123" (highest confidence)
-        var pattern1 = new Regex(@"Placa[:\s]+([A-Z]{3}[-]?\d{3,4})", RegexOptions.IgnoreCase);
+        // Pattern 1: "Placa: ABC123" or "Placa ABC-123" or "Placa HGW - 523" (highest confidence)
+        var pattern1 = new Regex(@"Placa[:\s]+([A-Z]{3}\s*-?\s*\d{3,4})", RegexOptions.IgnoreCase);
         var match1 = pattern1.Match(text);
         if (match1.Success)
         {
-            var placa = match1.Groups[1].Value.ToUpperInvariant();
+            var placa = NormalizePlaca(match1.Groups[1].Value);
             _logger.LogDebug("Placa matched with pattern 1 (Placa:): {Placa}", placa);
             return (placa, 0.9);
         }
 
-        // Pattern 2: "PLACA ABC123" (high confidence)
-        var pattern2 = new Regex(@"PLACA\s+([A-Z]{3}[-]?\d{3,4})", RegexOptions.IgnoreCase);
+        // Pattern 2: "PLACA ABC123" or "PLACA HGW - 523" (high confidence)
+        var pattern2 = new Regex(@"PLACA\s+([A-Z]{3}\s*-?\s*\d{3,4})", RegexOptions.IgnoreCase);
         var match2 = pattern2.Match(text);
         if (match2.Success)
         {
-            var placa = match2.Groups[1].Value.ToUpperInvariant();
+            var placa = NormalizePlaca(match2.Groups[1].Value);
             _logger.LogDebug("Placa matched with pattern 2 (PLACA): {Placa}", placa);
             return (placa, 0.85);
         }
 
-        // Pattern 3: Generic license plate format ABC123 or ABC-123 (lower confidence)
-        var pattern3 = new Regex(@"\b([A-Z]{3}[-]?\d{3,4})\b");
+        // Pattern 3: Generic license plate format ABC123 or ABC-123 or HGW - 523 (lower confidence)
+        var pattern3 = new Regex(@"\b([A-Z]{3}\s*-?\s*\d{3,4})\b");
         var match3 = pattern3.Match(text);
         if (match3.Success)
         {
-            var placa = match3.Groups[1].Value.ToUpperInvariant();
+            var placa = NormalizePlaca(match3.Groups[1].Value);
             _logger.LogDebug("Placa matched with pattern 3 (generic): {Placa}", placa);
             return (placa, 0.6);
         }
 
         _logger.LogDebug("No Placa pattern matched in text");
         return (null, 0);
+    }
+
+    private string NormalizePlaca(string placa)
+    {
+        // Remove extra spaces and standardize format to ABC-123
+        var normalized = placa.Trim().ToUpperInvariant();
+
+        // Remove all spaces
+        normalized = normalized.Replace(" ", "");
+
+        // Ensure format ABC-123 (add hyphen if missing)
+        if (!normalized.Contains("-") && normalized.Length >= 6)
+        {
+            // Insert hyphen between letters and numbers (ABC123 -> ABC-123)
+            normalized = normalized.Insert(3, "-");
+        }
+
+        _logger.LogDebug("Normalized Placa from '{Original}' to '{Normalized}'", placa, normalized);
+        return normalized;
     }
 
     private (DateTime? fecha, double confidence) ExtractFechaDeTanqueo(string text)
@@ -605,5 +634,154 @@ public class ReceiptProcessingService : IReceiptProcessingService
         var normalized = value.Replace(",", ".");
         return double.TryParse(normalized, System.Globalization.NumberStyles.Any,
             System.Globalization.CultureInfo.InvariantCulture, out result);
+    }
+
+    // ============= New Database-Backed Methods =============
+
+    public async Task<ReceiptUploadResponse> ProcessUploadedReceiptAsync(IFormFile file, CancellationToken cancellationToken = default)
+    {
+        if (_repository == null || _storageService == null || _validationService == null)
+        {
+            throw new InvalidOperationException("Database services are not configured. Ensure IReceiptRepository, IReceiptStorageService, and IFileValidationService are registered.");
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        var receiptId = Guid.NewGuid();
+
+        // Step 1: Validate file
+        var validationResult = await _validationService.ValidateUploadAsync(file);
+        if (!validationResult.IsValid)
+        {
+            _logger.LogWarning("File validation failed for {FileName}: {Errors}",
+                file.FileName, string.Join(", ", validationResult.Errors));
+
+            throw new InvalidOperationException($"File validation failed: {string.Join(", ", validationResult.Errors)}");
+        }
+
+        // Step 2: Create receipt entity
+        var receipt = new ReceiptEntity
+        {
+            Id = receiptId,
+            FileName = file.FileName,
+            FileSizeBytes = file.Length,
+            MimeType = validationResult.MimeType ?? file.ContentType,
+            PhotoPath = string.Empty, // Will be updated after saving
+            ProcessingStatus = ProcessingStatus.Processing,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        try
+        {
+            // Step 3: Save to database (initial state)
+            await _repository.CreateAsync(receipt, cancellationToken);
+            _logger.LogInformation("Created receipt entity {ReceiptId} for file {FileName}", receiptId, file.FileName);
+
+            // Step 4: Save photo to filesystem
+            var photoPath = await _storageService.SavePhotoAsync(file, receiptId, cancellationToken);
+            receipt.PhotoPath = photoPath;
+            await _repository.UpdateAsync(receipt, cancellationToken);
+
+            // Step 5: Process OCR
+            using var stream = file.OpenReadStream();
+            var analyzeResult = await _azureService.AnalyzeReceiptAsync(stream, cancellationToken);
+
+            // Step 6: Extract data and confidence
+            var (data, confidence) = ExtractReceiptData(analyzeResult);
+
+            // Step 7: Extract raw OCR text
+            var rawOcrText = string.Join(" ", analyzeResult.Pages
+                .SelectMany(p => p.Lines ?? Enumerable.Empty<DocumentLine>())
+                .Select(l => l.Content));
+
+            // Step 8: Serialize to JSON
+            var extractedFieldsJson = JsonSerializer.Serialize(data);
+            var confidenceScoresJson = JsonSerializer.Serialize(confidence);
+
+            // Step 9: Update receipt entity with results
+            receipt.RawOcrText = rawOcrText;
+            receipt.ExtractedFieldsJson = extractedFieldsJson;
+            receipt.ConfidenceScoresJson = confidenceScoresJson;
+            receipt.ProcessingStatus = ProcessingStatus.Completed;
+            receipt.ProcessingTimeMs = stopwatch.ElapsedMilliseconds;
+            receipt.ProcessedAt = DateTime.UtcNow;
+
+            await _repository.UpdateAsync(receipt, cancellationToken);
+
+            _logger.LogInformation("Successfully processed uploaded receipt {ReceiptId} in {Ms}ms",
+                receiptId, stopwatch.ElapsedMilliseconds);
+
+            // Step 10: Return response
+            return new ReceiptUploadResponse
+            {
+                Success = true,
+                FileName = file.FileName,
+                ReceiptId = receiptId,
+                Data = data,
+                Confidence = confidence,
+                ProcessingTimeMs = stopwatch.ElapsedMilliseconds
+            };
+        }
+        catch (RequestFailedException ex) when (ex.Status == 429)
+        {
+            _logger.LogWarning("Rate limit exceeded while processing uploaded receipt {ReceiptId}", receiptId);
+
+            receipt.ProcessingStatus = ProcessingStatus.Failed;
+            receipt.ErrorMessage = "Azure rate limit exceeded";
+            await _repository.UpdateAsync(receipt, cancellationToken);
+
+            throw new InvalidOperationException("Azure rate limit exceeded. Please wait before retrying.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error processing uploaded receipt {ReceiptId}", receiptId);
+
+            receipt.ProcessingStatus = ProcessingStatus.Failed;
+            receipt.ErrorMessage = ex.Message;
+            await _repository.UpdateAsync(receipt, cancellationToken);
+
+            throw;
+        }
+    }
+
+    public async Task<ReceiptEntity?> GetReceiptByIdAsync(Guid id, CancellationToken cancellationToken = default)
+    {
+        if (_repository == null)
+        {
+            throw new InvalidOperationException("Database services are not configured. Ensure IReceiptRepository is registered.");
+        }
+
+        return await _repository.GetByIdAsync(id, cancellationToken);
+    }
+
+    public async Task<PagedReceiptResponse> GetReceiptsPagedAsync(
+        int page,
+        int pageSize,
+        ProcessingStatus? status = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_repository == null)
+        {
+            throw new InvalidOperationException("Database services are not configured. Ensure IReceiptRepository is registered.");
+        }
+
+        var (items, totalCount) = await _repository.GetPagedAsync(page, pageSize, status, cancellationToken);
+
+        var receipts = items.Select(r => new ReceiptSummary
+        {
+            Id = r.Id,
+            FileName = r.FileName,
+            ProcessingStatus = r.ProcessingStatus.ToString(),
+            CreatedAt = r.CreatedAt,
+            ProcessedAt = r.ProcessedAt
+        }).ToList();
+
+        return new PagedReceiptResponse
+        {
+            Receipts = receipts,
+            TotalCount = totalCount,
+            Page = page,
+            PageSize = pageSize
+        };
     }
 }

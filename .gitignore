@@ -4,6 +4,12 @@ appsettings.Production.json
 **/appsettings.*.json
 !appsettings.json
 
+nul
+
+# Docker environment variables - NEVER commit these files
+.env
+.env.local
+
 # User-specific files
 *.rsuser
 *.suo

@@ -7,7 +7,14 @@
       "Bash(dotnet build:*)",
       "WebFetch(domain:azure.microsoft.com)",
       "WebSearch",
-      "Bash(dir \"C:\\\\Users\\\\Santiago.ramirez\\\\Downloads\\\\OCR\\\\OCRTest\" /b)"
+      "Bash(dir \"C:\\\\Users\\\\Santiago.ramirez\\\\Downloads\\\\OCR\\\\OCRTest\" /b)",
+      "Bash(docker-compose down:*)",
+      "Bash(docker-compose logs:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(dotnet ef migrations:*)",
+      "Bash(curl:*)",
+      "Bash(docker-compose exec:*)",
+      "Bash(docker-compose restart:*)"
     ]
   }
 }
