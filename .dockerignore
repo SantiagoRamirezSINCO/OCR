@@ -1,0 +1,35 @@
+# Build artifacts
+**/bin/
+**/obj/
+**/out/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+!CLAUDE.md
+
+# Environment files
+.env
+.env.local
+
+# Example receipts (will be in Docker volume)
+**/exampleReceipts/
+
+# Temp files
+**/temp/
+**/*.tmp
+
+# Test files
+**/TestResults/
+**/*.trx
